@@ -1,0 +1,14 @@
+{
+  "name": "outlook-on-message-send-sample",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "office-addin-dev-certs install && http-server . -p 3000 -S -C \"%USERPROFILE%\\.office-addin-dev-certs\\localhost.crt\" -K \"%USERPROFILE%\\.office-addin-dev-certs\\localhost.key\"",
+    "validate": "office-addin-manifest validate ../manifests/onMessageSend.xml"
+  },
+  "devDependencies": {
+    "http-server": "^14.1.1",
+    "office-addin-dev-certs": "^1.13.5",
+    "office-addin-manifest": "^1.13.10"
+  }
+}
