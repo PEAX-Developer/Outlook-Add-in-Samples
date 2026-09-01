@@ -3,11 +3,95 @@ console.log("onMessageSend/launchevent.js loaded");
 Office.initialize = function () {
 }
 
-function onMessageSendHandler(event) {
-  // Add message validation or processing here.
-  console.log("onMessageSendHandler called");
-  // TODO
-  event.completed({ allowEvent: true });
+const PIXEL_URL = new URL('/onMessageSend/assets/pixel.gif?source=on-message-send-repro', location.origin).href;
+
+function getBodyHtml() {
+  return new Promise((resolve, reject) => {
+    Office.context.mailbox.item.body.getAsync(Office.CoercionType.Html, result => {
+      if (result.status === Office.AsyncResultStatus.Succeeded) {
+        resolve(result.value);
+      } else {
+        reject(result.error);
+      }
+    });
+  });
+}
+
+function setBodyHtml(html) {
+  return new Promise((resolve, reject) => {
+    Office.context.mailbox.item.body.setAsync(
+      html,
+      { coercionType: Office.CoercionType.Html },
+      result => {
+        if (result.status === Office.AsyncResultStatus.Succeeded) {
+          resolve();
+        } else {
+          reject(result.error);
+        }
+      }
+    );
+  });
+}
+
+function findQuotedReplyBoundary(document) {
+  return document.querySelector(
+    '[id$="divRplyFwdMsg"], a[name="_MailOriginal"], span[style*="_MailOriginalBody"]'
+  );
+}
+
+function isBeforeBoundary(node, boundary) {
+  return (
+    !boundary ||
+    Boolean(node.compareDocumentPosition(boundary) & Node.DOCUMENT_POSITION_FOLLOWING)
+  );
+}
+
+async function onMessageSendHandler(event) {
+  try {
+    const originalHtml = await getBodyHtml();
+    const document = new DOMParser().parseFromString(originalHtml, 'text/html');
+    const quotedReplyBoundary = findQuotedReplyBoundary(document);
+
+    for (const link of document.querySelectorAll('a[href]')) {
+      if (!isBeforeBoundary(link, quotedReplyBoundary)) {
+        continue;
+      }
+
+      const href = link.getAttribute('href');
+      if (!href || !/^https?:/i.test(href)) {
+        continue;
+      }
+
+      const url = new URL(href);
+      url.searchParams.set('repro-click-tracking', '1');
+      link.setAttribute('href', url.href);
+    }
+
+    const pixel = document.createElement('img');
+    pixel.src = PIXEL_URL;
+    pixel.alt = '';
+    pixel.width = 1;
+    pixel.height = 1;
+    pixel.style.width = '1px';
+    pixel.style.height = '1px';
+
+    if (quotedReplyBoundary) {
+      quotedReplyBoundary.before(pixel);
+    } else {
+      document.body.append(pixel);
+    }
+
+    // The important operation is writing the complete body back, including
+    // unchanged quoted HTML and its existing cid: image references.
+    await setBodyHtml(document.documentElement.outerHTML);
+    event.completed({ allowEvent: true });
+  } catch (error) {
+    console.error('Minimal onMessageSend repro failed', error);
+    event.completed({
+      allowEvent: false,
+      errorMessage: 'The minimal onMessageSend repro handler failed.',
+    });
+  }
 }
 
 Office.actions.associate("onMessageSendHandler", onMessageSendHandler);
