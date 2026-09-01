@@ -46,6 +46,23 @@ function isBeforeBoundary(node, boundary) {
   );
 }
 
+// REPRO AID (not a fix): New Outlook's offline Action Queue evaluates the
+// SendItem action's attachment "blocking keys" synchronously. If Send is
+// allowed to proceed the instant setBodyHtml() resolves, the add-in
+// sometimes races ahead of the platform registering the blocking key at
+// all, so the platform bug only reproduces intermittently. Deliberately
+// delaying event.completed() by a short, fixed amount reliably lands
+// inside the platform's failure window instead, making
+// ErrorLocalAttachmentBlockingKeys reproduce on (close to) every send -
+// useful for capturing a clean HAR/console repro to attach to the platform
+// bug escalation. This is the opposite of a mitigation: it does not wait
+// on any real "attachment upload complete" signal (no such Office.js
+// signal exists), it just widens the window in which the platform's race
+// is lost. Do not ship this delay in a production add-in.
+function deliberateReproDelay(ms = 1000) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 async function onMessageSendHandler(event) {
   try {
     const originalHtml = await getBodyHtml();
@@ -89,6 +106,10 @@ async function onMessageSendHandler(event) {
     // insert at the current selection, so a full round trip is unavoidable
     // here given the link-rewrite requirement.
     await setBodyHtml(document.documentElement.outerHTML);
+
+    // See deliberateReproDelay() above: this delay exists only to make the
+    // platform race reproduce reliably for escalation purposes.
+    await deliberateReproDelay();
 
     event.completed({ allowEvent: true });
   } catch (error) {
