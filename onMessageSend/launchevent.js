@@ -46,36 +46,6 @@ function isBeforeBoundary(node, boundary) {
   );
 }
 
-// Give New Outlook a bounded window to resolve any newly-inserted inline
-// image's blob id to a server content id before letting Send proceed. This
-// is a defensive backstop for the ErrorLocalAttachmentBlockingKeys race, not
-// a guarantee - Office.js has no "attachment upload complete" event.
-function waitForAttachmentsSettled({ retries = 6, delayMs = 250 } = {}) {
-  return new Promise(resolve => {
-    let attempt = 0;
-    let lastCount = -1;
-
-    const check = () => {
-      Office.context.mailbox.item.getAttachmentsAsync(result => {
-        const count =
-          result.status === Office.AsyncResultStatus.Succeeded
-            ? result.value.length
-            : lastCount;
-
-        attempt += 1;
-        if (count === lastCount || attempt >= retries) {
-          resolve();
-          return;
-        }
-        lastCount = count;
-        setTimeout(check, delayMs);
-      });
-    };
-
-    check();
-  });
-}
-
 async function onMessageSendHandler(event) {
   try {
     const originalHtml = await getBodyHtml();
@@ -119,13 +89,6 @@ async function onMessageSendHandler(event) {
     // insert at the current selection, so a full round trip is unavoidable
     // here given the link-rewrite requirement.
     await setBodyHtml(document.documentElement.outerHTML);
-
-    // Give New Outlook a bounded window to resolve the newly-inserted inline
-    // image's blob id to a server content id before we let Send proceed.
-    // This is a defensive backstop for the ErrorLocalAttachmentBlockingKeys
-    // race, not a guarantee - Office.js has no "attachment upload complete"
-    // event to wait on directly.
-    await waitForAttachmentsSettled();
 
     event.completed({ allowEvent: true });
   } catch (error) {
