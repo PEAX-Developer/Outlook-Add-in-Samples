@@ -17,13 +17,9 @@ function getBodyHtml() {
   });
 }
 
-// Insert HTML at the current cursor/selection (defaults to the start of the
-// compose body) instead of getAsync()+setAsync() of the whole document. This
-// never touches or re-serializes the existing quoted thread/cid: images, so
-// New Outlook has nothing extra to reconcile there when Send is pressed.
-function insertAtStart(html) {
+function setBodyHtml(html) {
   return new Promise((resolve, reject) => {
-    Office.context.mailbox.item.body.setSelectedDataAsync(
+    Office.context.mailbox.item.body.setAsync(
       html,
       { coercionType: Office.CoercionType.Html },
       result => {
@@ -86,9 +82,6 @@ async function onMessageSendHandler(event) {
     const document = new DOMParser().parseFromString(originalHtml, 'text/html');
     const quotedReplyBoundary = findQuotedReplyBoundary(document);
 
-    // Only rewrite links that live in the new reply, above the quoted
-    // boundary - never re-touch the quoted HTML itself.
-    let linksRewritten = false;
     for (const link of document.querySelectorAll('a[href]')) {
       if (!isBeforeBoundary(link, quotedReplyBoundary)) {
         continue;
@@ -102,31 +95,36 @@ async function onMessageSendHandler(event) {
       const url = new URL(href);
       url.searchParams.set('repro-click-tracking', '1');
       link.setAttribute('href', url.href);
-      linksRewritten = true;
     }
 
-    if (linksRewritten) {
-      // Rewritten links only exist in the new-reply portion, so replace just
-      // that fragment instead of round-tripping the whole document.
-      const newReplyFragment = [];
-      for (const node of Array.from(document.body.childNodes)) {
-        if (!isBeforeBoundary(node, quotedReplyBoundary)) {
-          break;
-        }
-        newReplyFragment.push(node.outerHTML ?? node.textContent ?? '');
-      }
-      await insertAtStart(newReplyFragment.join(''));
+    const pixel = document.createElement('img');
+    pixel.src = PIXEL_URL;
+    pixel.alt = '';
+    pixel.width = 1;
+    pixel.height = 1;
+    pixel.style.width = '1px';
+    pixel.style.height = '1px';
+
+    if (quotedReplyBoundary) {
+      quotedReplyBoundary.before(pixel);
+    } else {
+      document.body.append(pixel);
     }
 
-    // Insert the pixel via the targeted API too, so it is the only new
-    // inline resource New Outlook needs to resolve - the quoted thread's
-    // existing cid: images are never re-serialized or re-written.
-    await insertAtStart(
-      `<img src="${PIXEL_URL}" alt="" width="1" height="1" style="width:1px;height:1px;" />`
-    );
+    // The important operation is writing the complete body back, including
+    // unchanged quoted HTML and its existing cid: image references. This is
+    // a single full-body write (not two), matching the original add-in
+    // behavior so there is no risk of duplicating content: Office.js has no
+    // API to replace an arbitrary range, only to get/set the whole body or
+    // insert at the current selection, so a full round trip is unavoidable
+    // here given the link-rewrite requirement.
+    await setBodyHtml(document.documentElement.outerHTML);
 
-    // Give New Outlook a bounded window to resolve the new inline image's
-    // blob id to a server content id before we let Send proceed.
+    // Give New Outlook a bounded window to resolve the newly-inserted inline
+    // image's blob id to a server content id before we let Send proceed.
+    // This is a defensive backstop for the ErrorLocalAttachmentBlockingKeys
+    // race, not a guarantee - Office.js has no "attachment upload complete"
+    // event to wait on directly.
     await waitForAttachmentsSettled();
 
     event.completed({ allowEvent: true });
