@@ -3,7 +3,26 @@ console.log("onMessageSend/launchevent.js loaded");
 Office.initialize = function () {
 }
 
-const PIXEL_URL = new URL('/onMessageSend/assets/pixel.gif?source=on-message-send-repro', location.origin).href;
+// The tracking pixel must stay a remote URL (not a file attachment) - the
+// whole point is that the recipient's mail client fetches it from our
+// server, which is how the "open" event is recorded. A plain remote <img>
+// is not an attachment link, so adding it to the body is fine; it's only
+// *existing* attachment/cid: links elsewhere in the body that must not be
+// touched by a plain body edit (see QUOTED_REPLY_BOUNDARY_PATTERN below).
+const PIXEL_URL = new URL('/onMessageSend/assets/pixel.gif?source=on-message-send', location.origin).href;
+
+// Matches the start of Outlook's quoted reply/forward markup. Everything at
+// or after this index is left completely untouched (see rewriteHtml below)
+// because it commonly contains existing inline image attachments referenced
+// by cid:, and New Outlook does not support editing a body that contains
+// attachment links except via the attachment APIs - re-serializing that
+// markup (even without changing it) through a DOM parser is what causes
+// ErrorLocalAttachmentBlockingKeys. Working on the raw HTML string instead
+// guarantees byte-for-byte preservation of anything we don't explicitly
+// touch.
+const QUOTED_REPLY_BOUNDARY_PATTERN = /<[^>]*\bid=(["'])[^"']*divRplyFwdMsg\1[^>]*>|<a\b[^>]*\bname=(["'])_MailOriginal\2[^>]*>|<span\b[^>]*\bstyle=(["'])[^"']*_MailOriginalBody[^"']*\3[^>]*>/i;
+
+const HREF_PATTERN = /(<a\b[^>]*\bhref=)(["'])(https?:\/\/[^"']*)\2/gi;
 
 function getBodyHtml() {
   return new Promise((resolve, reject) => {
@@ -33,90 +52,55 @@ function setBodyHtml(html) {
   });
 }
 
-function findQuotedReplyBoundary(document) {
-  return document.querySelector(
-    '[id$="divRplyFwdMsg"], a[name="_MailOriginal"], span[style*="_MailOriginalBody"]'
-  );
-}
+// Note: the tracking pixel intentionally stays a remote <img>, not a file
+// attachment - if an add-in ever needs to add a genuinely new *inline*
+// image (e.g. a signature logo), that must go through the attachment API:
+// Office.context.mailbox.item.addFileAttachmentFromBase64Async(base64,
+// fileName, { isInline: true }, callback), referencing the result in the
+// body as <img src="cid:fileName">.
 
-function isBeforeBoundary(node, boundary) {
-  return (
-    !boundary ||
-    Boolean(node.compareDocumentPosition(boundary) & Node.DOCUMENT_POSITION_FOLLOWING)
-  );
-}
-
-// REPRO AID (not a fix): New Outlook's offline Action Queue evaluates the
-// SendItem action's attachment "blocking keys" synchronously. If Send is
-// allowed to proceed the instant setBodyHtml() resolves, the add-in
-// sometimes races ahead of the platform registering the blocking key at
-// all, so the platform bug only reproduces intermittently. Deliberately
-// delaying event.completed() by a short, fixed amount reliably lands
-// inside the platform's failure window instead, making
-// ErrorLocalAttachmentBlockingKeys reproduce on (close to) every send -
-// useful for capturing a clean HAR/console repro to attach to the platform
-// bug escalation. This is the opposite of a mitigation: it does not wait
-// on any real "attachment upload complete" signal (no such Office.js
-// signal exists), it just widens the window in which the platform's race
-// is lost. Do not ship this delay in a production add-in.
-function deliberateReproDelay(ms = 1000) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+function rewriteHrefsForClickTracking(html) {
+  return html.replace(HREF_PATTERN, (match, prefix, quote, href) => {
+    try {
+      const url = new URL(href);
+      url.searchParams.set('click-tracking', '1');
+      return `${prefix}${quote}${url.href}${quote}`;
+    } catch {
+      // Not a parseable absolute URL; leave the link exactly as-is.
+      return match;
+    }
+  });
 }
 
 async function onMessageSendHandler(event) {
   try {
     const originalHtml = await getBodyHtml();
-    const document = new DOMParser().parseFromString(originalHtml, 'text/html');
-    const quotedReplyBoundary = findQuotedReplyBoundary(document);
 
-    for (const link of document.querySelectorAll('a[href]')) {
-      if (!isBeforeBoundary(link, quotedReplyBoundary)) {
-        continue;
-      }
+    const boundaryMatch = originalHtml.match(QUOTED_REPLY_BOUNDARY_PATTERN);
+    const boundaryIndex = boundaryMatch ? boundaryMatch.index : originalHtml.length;
 
-      const href = link.getAttribute('href');
-      if (!href || !/^https?:/i.test(href)) {
-        continue;
-      }
+    // headHtml is the only part of the body we ever rewrite. tailHtml
+    // (the quoted/forwarded history and anything in it, including existing
+    // cid: attachment references) is carried through unchanged, character
+    // for character.
+    const headHtml = originalHtml.slice(0, boundaryIndex);
+    const tailHtml = originalHtml.slice(boundaryIndex);
 
-      const url = new URL(href);
-      url.searchParams.set('repro-click-tracking', '1');
-      link.setAttribute('href', url.href);
-    }
+    const rewrittenHead = rewriteHrefsForClickTracking(headHtml);
+    const pixelTag = `<img src="${PIXEL_URL}" alt="" width="1" height="1" style="width:1px;height:1px;" />`;
 
-    const pixel = document.createElement('img');
-    pixel.src = PIXEL_URL;
-    pixel.alt = '';
-    pixel.width = 1;
-    pixel.height = 1;
-    pixel.style.width = '1px';
-    pixel.style.height = '1px';
-
-    if (quotedReplyBoundary) {
-      quotedReplyBoundary.before(pixel);
-    } else {
-      document.body.append(pixel);
-    }
-
-    // The important operation is writing the complete body back, including
-    // unchanged quoted HTML and its existing cid: image references. This is
-    // a single full-body write (not two), matching the original add-in
-    // behavior so there is no risk of duplicating content: Office.js has no
-    // API to replace an arbitrary range, only to get/set the whole body or
-    // insert at the current selection, so a full round trip is unavoidable
-    // here given the link-rewrite requirement.
-    await setBodyHtml(document.documentElement.outerHTML);
-
-    // See deliberateReproDelay() above: this delay exists only to make the
-    // platform race reproduce reliably for escalation purposes.
-    await deliberateReproDelay();
+    // Single full-body write (Office.js has no API to replace only part of
+    // the body), but everything after headHtml is untouched original bytes -
+    // no existing attachment/cid: reference anywhere in the body is
+    // re-serialized or otherwise touched.
+    await setBodyHtml(rewrittenHead + pixelTag + tailHtml);
 
     event.completed({ allowEvent: true });
   } catch (error) {
-    console.error('Minimal onMessageSend repro failed', error);
+    console.error('onMessageSendHandler failed', error);
     event.completed({
       allowEvent: false,
-      errorMessage: 'The minimal onMessageSend repro handler failed.',
+      errorMessage: 'The onMessageSend handler failed.',
     });
   }
 }
